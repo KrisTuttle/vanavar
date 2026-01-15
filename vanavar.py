@@ -9,6 +9,7 @@ Store any line, find it by any term (prefix match by default).
 """
 
 import sqlite3
+import os
 from pathlib import Path
 from datetime import datetime
 
@@ -18,7 +19,8 @@ try:
 except ImportError:
     HAS_READLINE = False
 
-DB_PATH = Path(__file__).parent / "vanavar.db"
+# Use VANAVAR_DB env var if set, otherwise local
+DB_PATH = Path(os.environ.get('VANAVAR_DB', Path(__file__).parent / "vanavar.db"))
 
 
 def input_with_prefill(prompt, prefill=''):
@@ -158,6 +160,7 @@ def run_repl():
     conn = init_db()
 
     print("vanavar - associative memory")
+    print(f"db: {DB_PATH}")
     print(f"({count(conn)} entries)")
     print("Type 'help' for commands\n")
 
