@@ -195,6 +195,34 @@ def import_entries(conn, filepath):
     return n
 
 
+def parse_selection(selection, max_num):
+    """Parse selection like '1,2', '1-3', 'all' into list of indices (0-based)."""
+    selection = selection.strip().lower()
+    if selection == 'all':
+        return list(range(max_num))
+
+    indices = set()
+    for part in selection.split(','):
+        part = part.strip()
+        if '-' in part:
+            try:
+                start, end = part.split('-', 1)
+                start, end = int(start.strip()), int(end.strip())
+                for i in range(start, end + 1):
+                    if 1 <= i <= max_num:
+                        indices.add(i - 1)
+            except ValueError:
+                pass
+        else:
+            try:
+                i = int(part)
+                if 1 <= i <= max_num:
+                    indices.add(i - 1)
+            except ValueError:
+                pass
+    return sorted(indices)
+
+
 def sync(local_conn, remote_path):
     """
     Sync local database with remote database.
@@ -277,6 +305,7 @@ Find by any term (prefix match by default):
 
 Edit entries:
     edit alex           - find matches, pick one to edit
+    merge alex          - merge multiple entries into one
 
 Commands:
     list                - show recent entries
@@ -343,6 +372,42 @@ Commands:
                             print("(no change)")
                     else:
                         print("(cancelled)")
+                except (EOFError, KeyboardInterrupt):
+                    print("\n(cancelled)")
+
+        elif lower.startswith('merge '):
+            term = text[6:]
+            results = find(conn, term)
+            if not results:
+                print("Nothing found.")
+            elif len(results) == 1:
+                print("Only one match - nothing to merge.")
+            else:
+                print("Select entries to merge:")
+                for i, (rowid, content) in enumerate(results, 1):
+                    print(f"  {i}. {content}")
+                try:
+                    selection = input("Entries (e.g., 1,2 or 1-3 or all): ").strip()
+                    indices = parse_selection(selection, len(results))
+                    if len(indices) < 2:
+                        print("Need at least 2 entries to merge.")
+                    else:
+                        # Combine content from selected entries
+                        selected = [results[i] for i in indices]
+                        merged_content = ' '.join(content for rowid, content in selected)
+                        print(f"Merged: {merged_content}")
+
+                        # Let user edit the merged result
+                        final_content = input_with_prefill("", merged_content).strip()
+                        if final_content:
+                            # Store new merged entry
+                            store(conn, final_content)
+                            # Delete original entries
+                            for rowid, content in selected:
+                                delete_by_id(conn, rowid)
+                            print(f"Saved. Removed {len(selected)} original entries.")
+                        else:
+                            print("(cancelled)")
                 except (EOFError, KeyboardInterrupt):
                     print("\n(cancelled)")
 
