@@ -3,13 +3,16 @@
 vanavar - associative memory
 
 Store any line, find it by any term (prefix match by default).
+Supports offline use with sync to shared database.
     > VSNT reporter "Alex Sherman" alex.sherman@versantmedia.com @sherman4949
     > find alex
     > find VSNT
+    > sync /path/to/shared.db
 """
 
 import sqlite3
 import os
+import uuid as uuid_lib
 from pathlib import Path
 from datetime import datetime
 
@@ -40,23 +43,60 @@ def input_with_prefill(prompt, prefill=''):
         return result
 
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS entries USING fts5(
-            content,
-            created_at UNINDEXED
-        )
-    """)
-    conn.commit()
+def init_db(db_path=None):
+    """Initialize database, migrating if needed."""
+    if db_path is None:
+        db_path = DB_PATH
+    conn = sqlite3.connect(db_path)
+
+    # Check if we need to migrate (old schema without uuid)
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='entries'")
+    table_exists = cur.fetchone() is not None
+
+    if table_exists:
+        # Check if uuid column exists by looking at table info
+        cur = conn.execute("PRAGMA table_info(entries)")
+        columns = [row[1] for row in cur.fetchall()]
+
+        if 'uuid' not in columns:
+            # Migrate: backup data, drop table, recreate with uuid
+            print("Migrating database to add UUID support...")
+            cur = conn.execute("SELECT content, created_at FROM entries")
+            old_entries = cur.fetchall()
+            conn.execute("DROP TABLE entries")
+            conn.execute("""
+                CREATE VIRTUAL TABLE entries USING fts5(
+                    content,
+                    uuid UNINDEXED,
+                    created_at UNINDEXED
+                )
+            """)
+            for content, created_at in old_entries:
+                conn.execute(
+                    "INSERT INTO entries (content, uuid, created_at) VALUES (?, ?, ?)",
+                    (content, str(uuid_lib.uuid4()), created_at)
+                )
+            conn.commit()
+            print(f"Migrated {len(old_entries)} entries.")
+    else:
+        # Create new table with uuid
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS entries USING fts5(
+                content,
+                uuid UNINDEXED,
+                created_at UNINDEXED
+            )
+        """)
+        conn.commit()
+
     return conn
 
 
 def store(conn, text):
-    """Store a line."""
+    """Store a line with a new UUID."""
     conn.execute(
-        "INSERT INTO entries (content, created_at) VALUES (?, ?)",
-        (text, datetime.now().isoformat())
+        "INSERT INTO entries (content, uuid, created_at) VALUES (?, ?, ?)",
+        (text, str(uuid_lib.uuid4()), datetime.now().isoformat())
     )
     conn.commit()
 
@@ -145,14 +185,57 @@ def export_entries(conn, filepath):
 
 def import_entries(conn, filepath):
     """Import entries from a file (one per line)."""
-    count = 0
+    n = 0
     with open(filepath, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if line:
                 store(conn, line)
-                count += 1
-    return count
+                n += 1
+    return n
+
+
+def sync(local_conn, remote_path):
+    """
+    Sync local database with remote database.
+    - Push: local entries not in remote -> remote
+    - Pull: remote entries not in local -> local
+    Returns (pushed, pulled) counts.
+    """
+    remote_conn = init_db(remote_path)
+
+    # Get all UUIDs from both databases
+    local_cur = local_conn.execute("SELECT uuid, content, created_at FROM entries")
+    local_entries = {row[0]: (row[1], row[2]) for row in local_cur.fetchall()}
+
+    remote_cur = remote_conn.execute("SELECT uuid, content, created_at FROM entries")
+    remote_entries = {row[0]: (row[1], row[2]) for row in remote_cur.fetchall()}
+
+    local_uuids = set(local_entries.keys())
+    remote_uuids = set(remote_entries.keys())
+
+    # Push: entries in local but not remote
+    to_push = local_uuids - remote_uuids
+    for uuid in to_push:
+        content, created_at = local_entries[uuid]
+        remote_conn.execute(
+            "INSERT INTO entries (content, uuid, created_at) VALUES (?, ?, ?)",
+            (content, uuid, created_at)
+        )
+    remote_conn.commit()
+
+    # Pull: entries in remote but not local
+    to_pull = remote_uuids - local_uuids
+    for uuid in to_pull:
+        content, created_at = remote_entries[uuid]
+        local_conn.execute(
+            "INSERT INTO entries (content, uuid, created_at) VALUES (?, ?, ?)",
+            (content, uuid, created_at)
+        )
+    local_conn.commit()
+
+    remote_conn.close()
+    return len(to_push), len(to_pull)
 
 
 def run_repl():
@@ -201,6 +284,7 @@ Commands:
     count               - show total entries
     import <file>       - import entries from file
     export <file>       - export entries to file
+    sync <path>         - sync with shared database
     quit                - exit
 """)
 
@@ -319,6 +403,20 @@ Commands:
                 print(f"Exported {len(entries)} entries to {filepath}")
             except Exception as e:
                 print(f"Error: {e}")
+
+        elif lower.startswith('sync '):
+            remote_path = text[5:].strip()
+            if not remote_path:
+                print("Usage: sync <path-to-shared-db>")
+            else:
+                try:
+                    pushed, pulled = sync(conn, remote_path)
+                    print(f"Synced: pushed {pushed}, pulled {pulled}")
+                except Exception as e:
+                    print(f"Sync error: {e}")
+
+        elif lower == 'sync':
+            print("Usage: sync <path-to-shared-db>")
 
         else:
             # Store as a new entry
